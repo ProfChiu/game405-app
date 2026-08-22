@@ -1,9 +1,9 @@
+<!DOCTYPE html>
 <!-- =======================================================
      GENERATED FILE — DO NOT EDIT.
-     Version B (cloud), built 2026-08-21 23:40
+     Version B (cloud), built 2026-08-22 00:06
      Edit ../../index.html and run build-versions.command.
      ======================================================= -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -842,7 +842,21 @@ function setHomeView(mode) {
 const G405_FIREBASE = { dbUrl: "https://game405-sprint-default-rtdb.firebaseio.com/" };
 
 let BACKEND_MODE = "server";               // decided by detectBackendMode()
+let lastBackendError = "";                 // shown on the failure screen, so a
+                                           // dead database says WHY on screen
+                                           // rather than only in the console
 const LOCAL_KEY  = "g405_local_v1";        // Version C's whole database
+
+/* api.php stamps updatedAt with date('Y-m-d H:i:s'). The local and cloud
+   backends MUST produce the same shape: the three backends being
+   protocol-identical is the whole reason the rest of the app does not know
+   which one it is talking to. Stamping a raw epoch number here instead reached
+   timeAgo() as a number, threw inside render(), and blanked the entire app. */
+function stampNow() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+         p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
 
 /* What each mode can actually do. The UI asks before rendering a button, so
    nothing on screen leads to a 501. */
@@ -918,7 +932,7 @@ const LocalBackend = {
 
     if (action === "save_project") {
       const p = JSON.parse(body);
-      p.updatedAt = Date.now();
+      p.updatedAt = stampNow();
       const i = db.projects.findIndex(x => x.id === p.id);
       if (i === -1) db.projects.push(p); else db.projects[i] = p;
       this.write(db);
@@ -1130,7 +1144,7 @@ const CloudBackend = {
         // Stamped by whichever browser saved, not by Firebase. Only ever
         // compared for inequality, so a few seconds of clock skew between
         // student machines changes nothing.
-        p.updatedAt = Date.now();
+        p.updatedAt = stampNow();
         const patch = {};
         patch["projects/" + p.id]       = JSON.stringify(p);
         patch["index/projects/" + p.id] = p.updatedAt;
@@ -1170,7 +1184,8 @@ const CloudBackend = {
 
     } catch (e) {
       console.error("Cloud backend error:", e);
-      return fauxResponse(503, { error: e.message || "Could not reach the database." });
+      lastBackendError = e.message || String(e);
+      return fauxResponse(503, { error: lastBackendError });
     }
   }
 };
@@ -1245,8 +1260,18 @@ async function loadState() {
     return true;
   } catch (e) {
     console.error("Error loading state from server:", e);
+    if (!lastBackendError) lastBackendError = e.message || String(e);
     return false;
   }
+}
+
+/* Turn a failed response into one sentence a person can act on. */
+async function describeFailure(res, doing) {
+  let msg = "";
+  try { msg = ((await res.clone().json()) || {}).error || ""; } catch (e) {}
+  if (!msg) { try { msg = (await res.clone().text() || "").slice(0, 200); } catch (e) {} }
+  lastBackendError = "HTTP " + res.status + " while " + doing + (msg ? ": " + msg : "");
+  return lastBackendError;
 }
 
 async function seedDatabase() {
@@ -1254,19 +1279,26 @@ async function seedDatabase() {
   const sample = sampleData();
   sample.projects.forEach(normalizeProject); // store in the sub-story model
 
-  await apiFetch("api.php?action=save_roster", {
+  /* Every write here used to be assumed to work. When one did not, the error
+     body was pushed into state.projects as though it were a project and the
+     next render() walked into it — which surfaced as "the app failed to start"
+     with no hint that the real problem was a rejected write. Check, and fail
+     with whatever the backend actually said. */
+  const rres = await apiFetch("api.php?action=save_roster", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(sample.roster)
   });
+  if (!rres.ok) throw new Error(await describeFailure(rres, "saving the roster"));
   state.roster = sample.roster;
-  
+
   for (const p of sample.projects) {
     const res = await apiFetch("api.php?action=save_project", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(p)
     });
+    if (!res.ok) throw new Error(await describeFailure(res, "saving a project"));
     const saved = await res.json();
     state.projects.push(saved);
   }
@@ -1541,9 +1573,15 @@ function drawSpark(cv,sp){
 }
 
 /* ---------- relative time helper ---------- */
-function timeAgo(dateString) {
-  if (!dateString) return "Never";
-  const d = new Date(dateString.replace(" ", "T"));
+function timeAgo(value) {
+  if (!value) return "Never";
+  /* api.php sends 'Y-m-d H:i:s'. Accept a raw epoch number too: early cloud and
+     local records hold one, and this runs on every row of the daily board — it
+     is not allowed to be the thing that takes the whole app down again. */
+  const d = typeof value === "number"
+    ? new Date(value)
+    : new Date(String(value).replace(" ", "T"));
+  if (isNaN(d.getTime())) return "Unknown";
   const now = new Date();
   const diffMs = now - d;
   const diffMins = Math.round(diffMs / 60000);
@@ -4077,23 +4115,39 @@ function stampModeChip(){
     if (await loadState()) { render(); startPolling(); return; }
 
     // Only reachable in cloud mode: local storage cannot fail to answer and
-    // server mode has already gone to the lock screen. Almost always either no
-    // internet or a wrong/blocked database URL.
-    document.getElementById("app").innerHTML =
-      `<div class="empty">Could not reach the class database.<br><br>
-       Check your internet connection and reload. If it keeps happening the
-       database URL in this file may be wrong \u2014 the browser console has the
-       exact error.</div>`;
+    // server mode has already gone to the lock screen. Almost always the
+    // database rules, a wrong URL, or no internet.
+    bootFailure("Could not reach the class database.");
   }catch(e){
     // Reaching here now means something broke in the app itself: local mode is
     // the fallback and it cannot fail to answer, so this is no longer the
     // "server is down" path it used to be.
     console.error("Boot failed:", e);
-    document.getElementById("app").innerHTML =
-      `<div class="empty">The app failed to start. Reload the page; if it keeps
-       happening, note the error in the browser console.</div>`;
+    if (!lastBackendError) lastBackendError = e.message || String(e);
+    bootFailure("The app failed to start.");
   }
 })();
+
+/* The failure screen is the only thing on it, so it has to carry the diagnosis.
+   Printing the backend's own words here has saved more time than any amount of
+   "check the console" ever did. */
+function bootFailure(headline) {
+  const detail = lastBackendError
+    ? `<div style="margin-top:14px;font-size:12px;opacity:.75;text-align:left;
+         display:inline-block;max-width:640px">
+         <b>What the database said:</b><br>
+         <code style="white-space:pre-wrap;word-break:break-word">${esc(lastBackendError)}</code>
+       </div>`
+    : "";
+  const hint = BACKEND_MODE === "cloud"
+    ? `<div style="margin-top:14px;font-size:12px;opacity:.75">
+         If this mentions <b>permission denied</b>, the database rules are still
+         locked \u2014 see step 3 of FIREBASE-SETUP.md.
+       </div>`
+    : "";
+  document.getElementById("app").innerHTML =
+    `<div class="empty">${esc(headline)} Reload the page to try again.${detail}${hint}</div>`;
+}
 
 window.addEventListener("resize",()=>{ if(location.hash.includes("/p/")) render(); });
 </script>
