@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!-- =======================================================
      GENERATED FILE — DO NOT EDIT.
-     Version B (cloud), built 2026-08-22 00:06
+     Version B (cloud), built 2026-08-22 00:23
      Edit ../../index.html and run build-versions.command.
      ======================================================= -->
 <html lang="en">
@@ -1030,8 +1030,14 @@ async function detectBackendMode() {
    ========================================================= */
 const CloudBackend = {
   /* Everything downloaded so far, so a poll only fetches what changed:
-     {roster, settings, projects:{id:project}, rosterAt, settingsAt} */
+     {roster, settings, projects:{id:project}, stamps:{id:rev}, rosterAt, settingsAt} */
   cache: null,
+
+  /* The /index node holds one of these per record. It is deliberately NOT
+     updatedAt: that is a display value with only second resolution, so two
+     saves inside the same second looked identical and other browsers stopped
+     re-downloading. A revision token only has to be different every time. */
+  rev() { return Date.now() + "-" + uid(); },
 
   url(path) {
     return G405_FIREBASE.dbUrl.replace(/\/+$/, "") + "/" + path + ".json";
@@ -1083,7 +1089,7 @@ const CloudBackend = {
   async loadAll() {
     const idx   = (await this.req("GET", "index")) || {};
     const cold  = !this.cache;
-    const c     = this.cache || { roster: [], settings: {}, projects: {},
+    const c     = this.cache || { roster: [], settings: {}, projects: {}, stamps: {},
                                   rosterAt: null, settingsAt: null };
 
     const rosterAt = idx.rosterAt || null;
@@ -1099,14 +1105,16 @@ const CloudBackend = {
     // Rebuild the project map from the index, so an id the index no longer
     // lists is dropped — that is how a delete reaches the other browsers.
     const stamps = this.stamps(idx.projects);
-    const next = {};
+    const next = {}, seen = {};
     for (const id of Object.keys(stamps)) {
-      const known = c.projects[id];
-      if (known && known.updatedAt === stamps[id]) { next[id] = known; continue; }
+      if (c.projects[id] && c.stamps[id] === stamps[id]) {
+        next[id] = c.projects[id]; seen[id] = stamps[id]; continue;
+      }
       const p = this.decode(await this.req("GET", "projects/" + id), null);
-      if (p) next[id] = p;
+      if (p) { next[id] = p; seen[id] = stamps[id]; }
     }
     c.projects = next;
+    c.stamps   = seen;
 
     this.cache = c;
     return c;
@@ -1145,11 +1153,12 @@ const CloudBackend = {
         // compared for inequality, so a few seconds of clock skew between
         // student machines changes nothing.
         p.updatedAt = stampNow();
+        const rev = this.rev();
         const patch = {};
         patch["projects/" + p.id]       = JSON.stringify(p);
-        patch["index/projects/" + p.id] = p.updatedAt;
+        patch["index/projects/" + p.id] = rev;
         await this.req("PATCH", "", patch);
-        if (this.cache) this.cache.projects[p.id] = p;
+        if (this.cache) { this.cache.projects[p.id] = p; this.cache.stamps[p.id] = rev; }
         return fauxResponse(200, p);
       }
 
@@ -1159,13 +1168,13 @@ const CloudBackend = {
         patch["projects/" + id]       = null;   // null deletes the node
         patch["index/projects/" + id] = null;
         await this.req("PATCH", "", patch);
-        if (this.cache) delete this.cache.projects[id];
+        if (this.cache) { delete this.cache.projects[id]; delete this.cache.stamps[id]; }
         return fauxResponse(200, { ok: true });
       }
 
       if (action === "save_roster") {
         const roster = JSON.parse(body);
-        const at = Date.now();
+        const at = this.rev();
         await this.req("PATCH", "", { roster: JSON.stringify(roster), "index/rosterAt": at });
         if (this.cache) { this.cache.roster = roster; this.cache.rosterAt = at; }
         return fauxResponse(200, { ok: true });
@@ -1173,7 +1182,7 @@ const CloudBackend = {
 
       if (action === "save_settings") {
         const settings = JSON.parse(body);
-        const at = Date.now();
+        const at = this.rev();
         await this.req("PATCH", "", { settings: JSON.stringify(settings), "index/settingsAt": at });
         if (this.cache) { this.cache.settings = settings; this.cache.settingsAt = at; }
         return fauxResponse(200, { ok: true });
@@ -1422,9 +1431,12 @@ function startPolling() {
           normalizeAll();
           changed = true;
         } else {
+          // Compare content, not just updatedAt: that stamp has one-second
+          // resolution, so two edits landing in the same second used to look
+          // identical here and the board silently kept showing the older one.
           for (const dp of data.projects) {
             const sp = state.projects.find(x => x.id === dp.id);
-            if (!sp || sp.updatedAt !== dp.updatedAt) {
+            if (!sp || JSON.stringify(sp) !== JSON.stringify(dp)) {
               changed = true;
               break;
             }
