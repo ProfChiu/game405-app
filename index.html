@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!-- =======================================================
      GENERATED FILE — DO NOT EDIT.
-     Version B (cloud), built 2026-08-22 00:23
+     Version B (cloud), built 2026-08-24 16:26
      Edit ../../index.html and run build-versions.command.
      ======================================================= -->
 <html lang="en">
@@ -409,7 +409,7 @@
    Everything below simply reacts to the role the server reports back.
    ========================================================= */
 
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.3.1";
 const STATUSES = ["Not Started","In Progress","Completed","Approved","Backburner"];
 const CATS = ["Design","Art","Tech","Other"];
 const TYPES = [["Environment","b-env"],["Character","b-char"],["Game","b-game"],["Team","b-team"]];
@@ -866,8 +866,27 @@ function modeHas(feature) {
   return ["auth", "roles", "notes", "backups", "uploads", "viewAs"].indexOf(feature) === -1;
 }
 
-const NO_UPLOADS = "Uploading files needs the server build.\n\nThis build stores images by URL instead: " +
-  "paste a link to an image that is already online.";
+/* Version A uploads a file; B and C take a link to an image that is already
+   online. Both routes hang off the SAME three entry points — banner, portrait,
+   card image — so clicking one never dead-ends. It used to: the old NO_UPLOADS
+   alert told you to paste a URL and then offered nowhere to paste it, which is
+   worse than a missing feature because it reads like a bug in the app.
+
+   https only, matching the task-image field at #td-img-add. An http:// image
+   on an https:// page is blocked as mixed content, so it would arrive as a
+   broken box with nothing on screen explaining why. */
+function promptImageUrl(what){
+  const raw = prompt(
+    "Paste a link to " + what + ".\n\n" +
+    "It has to be an image that is already online — in most browsers, " +
+    "right-click the image and choose Copy Image Address.\n\n" +
+    "Uploading a file from this computer needs the server build.", "https://");
+  if(raw===null) return null;                       // cancelled
+  const url = String(raw).trim();
+  if(!url || url==="https://") return null;         // cancelled by clearing it
+  if(!/^https:\/\//i.test(url)){ alert("Image URL must start with https://"); return null; }
+  return { url: url, name: url.split("/").pop() || url };
+}
 
 /* A Response, as much of one as apiFetch and its callers actually use. */
 function fauxResponse(status, data) {
@@ -1900,14 +1919,20 @@ function projBanner(p){
        title="${b?"Click to replace the project banner":"Click to add a project banner"}">
     ${b?`<img src="${esc(b.url)}" alt="">`:`<div class="ph">＋ Add a project banner</div>`}
     <div class="tools">
-      ${modeHas("uploads")?`<button type="button" onclick="event.stopPropagation();setProjectBanner('${p.id}')">${b?"replace":"add"}</button>`:""}
+      <button type="button" onclick="event.stopPropagation();setProjectBanner('${p.id}')">${b?"replace":"add"}</button>
       ${b?`<button type="button" onclick="event.stopPropagation();clearProjectBanner('${p.id}')">remove</button>`:""}
     </div>
   </div>`;
 }
 async function setProjectBanner(pid){
-  if(!modeHas("uploads")){ alert(NO_UPLOADS); return; }
   const p=findProj(pid); if(!p) return;
+  if(!modeHas("uploads")){
+    const img=promptImageUrl("the project banner"); if(!img) return;
+    p.banner=img;
+    await saveProject(p);
+    render();
+    return;
+  }
   pickImage(async file=>{
     if(file.size>5*1024*1024){ alert("Image exceeds the 5MB limit."); return; }
     try{
@@ -3285,10 +3310,19 @@ function showExposureBanner(){
    recorded on the roster entry. Two writes, and the second can fail — so the
    local edit is rolled back if saveRoster() says no, rather than leaving the
    UI showing a photo the server never accepted. */
-function setRosterPhoto(rid){
-  if(!modeHas("uploads")){ alert(NO_UPLOADS); return; }
+async function setRosterPhoto(rid){
   const r=state.roster.find(x=>x.id===rid);
   if(!r){ alert("That student is no longer on the roster."); return; }
+  if(!modeHas("uploads")){
+    // No cropper here — it re-encodes a File, and there is no file. The image
+    // is CSS-cropped to the frame like every other portrait.
+    const img=promptImageUrl("this student's photo"); if(!img) return;
+    const before=r.photo;
+    r.photo={url:img.url,name:img.name||"portrait.jpg"};
+    if(!(await saveRoster())){ r.photo=before; alert("The roster could not be saved."); }
+    render();
+    return;
+  }
   pickImage(file=>openPortraitCropper(file, async cropped=>{
     try{
       const fd=new FormData(); fd.append("file",cropped);
@@ -3600,9 +3634,17 @@ function pickImage(cb,accept){
   inp.click();
 }
 async function setCardImage(slot){
-  if(!modeHas("uploads")){ alert(NO_UPLOADS); return; }
   const p=cardProject(cardRoster());
   if(!p){ alert("This student has no project yet — create one first."); return; }
+  if(!modeHas("uploads")){
+    const img=promptImageUrl(slot==="portrait"?"the project portrait":"the project banner");
+    if(!img) return;
+    const cur=state.projects.find(x=>x.id===p.id)||p;
+    cur[slot]=img;
+    await saveProject(cur);
+    renderStudentCard();
+    return;
+  }
   pickImage(async file=>{
     noteStatus("uploading "+slot+"…");
     try{
